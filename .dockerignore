@@ -1,0 +1,13 @@
+# Keep the build context lean. docker/Dockerfile builds from source (needs src/, pom.xml,
+# mvnw, .mvn/); target/ is kept so the legacy prebuilt-jar root Dockerfile still works.
+.git/
+.github/
+.idea/
+*.iml
+e2etests/target/
+docs/
+input/
+quality/
+*.log
+**/.env
+.env

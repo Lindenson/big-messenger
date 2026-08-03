@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Build + unit tests (JDK 25). Quarkus @QuarkusTest uses Testcontainers,
+  #    which needs Docker — available on ubuntu-latest runners. ──
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      - name: Build + unit tests
+        run: ./mvnw -B -ntp verify
+
+      - name: Publish test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: target/surefire-reports/
+          if-no-files-found: ignore
+
+  # ── Build the container image (proves docker/Dockerfile stays buildable). ──
+  docker-image:
+    needs: build-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -f docker/Dockerfile -t hormiga-messenger:${{ github.sha }} .
+
+      # To publish, add registry login (e.g. GHCR) + push here:
+      #   - uses: docker/login-action@v3
+      #     with: { registry: ghcr.io, username: ${{ github.actor }}, password: ${{ secrets.GITHUB_TOKEN }} }
+      #   - run: |
+      #       docker tag hormiga-messenger:${{ github.sha }} ghcr.io/${{ github.repository }}:${{ github.sha }}
+      #       docker push ghcr.io/${{ github.repository }}:${{ github.sha }}
+
+  # ── E2E (Karate + WebSocket) is a separate module: app on JDK 25, tests on JDK 21,
+  #    against the docker/ stack. Wire it as its own job when you want it in CI:
+  #    bring up docker-compose, then `cd e2etests && JAVA_HOME=<21> mvn -Ppreprod test`.

@@ -1,0 +1,126 @@
+syntax = "proto3";
+
+// Consumer mirror of the Identity Directory contract for JVM services
+// (HormigaMessenger et al.). It is WIRE-COMPATIBLE with the server contract in
+// api/proto/ids/v1/identity.proto — same package, service, method names and
+// field numbers — but is self-contained: the server-side protovalidate options
+// are omitted so this file compiles with a plain protoc / quarkus-grpc build
+// (no buf.build dependency required). Keep field numbers in sync with the
+// canonical proto.
+package ids.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option java_multiple_files = true;
+option java_package = "org.hormigas.ids.grpc.v1";
+
+// IdentityDirectory is the single trusted gateway to identity lookups.
+service IdentityDirectory {
+  // GetUser returns a single user by id — backs ClientDirectory.findById.
+  rpc GetUser(GetUserRequest) returns (GetUserResponse);
+
+  // BatchGetUsers resolves many users in one round trip.
+  rpc BatchGetUsers(BatchGetUsersRequest) returns (BatchGetUsersResponse);
+
+  // UserExists is a cheap presence check by id or email.
+  rpc UserExists(UserExistsRequest) returns (UserExistsResponse);
+
+  // ListUsers returns users in a stable keyset order — backs
+  // ClientDirectory.listClients (page through until next_page_token is empty).
+  rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
+
+  // SearchUsers runs a filtered, sorted, type-ahead search.
+  rpc SearchUsers(SearchUsersRequest) returns (SearchUsersResponse);
+}
+
+// Role is the coarse authorization role. Unknown upstream values map to
+// ROLE_UNSPECIFIED.
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_USER = 1;
+  ROLE_MASTER = 2;
+  ROLE_CLIENT = 3;
+  ROLE_ADMIN = 4;
+}
+
+// Status is the lifecycle state derived from the Kratos identity state.
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_ACTIVE = 1;
+  STATUS_INACTIVE = 2;
+}
+
+// User is the projected identity. Maps to Messenger's ClientData as:
+// id->id, display_name(or first+last/email)->name, role->role, email->email.
+message User {
+  string id = 1;
+  string email = 2;
+
+  string display_name = 3;
+  string first_name = 4;
+  string last_name = 5;
+
+  string avatar_url = 6;
+  string locale = 7;
+
+  Role role = 8;
+  Status status = 9;
+
+  bool verified = 10;
+
+  google.protobuf.Timestamp updated_at = 11;
+}
+
+message GetUserRequest {
+  string id = 1;
+}
+
+message GetUserResponse {
+  User user = 1;
+}
+
+message BatchGetUsersRequest {
+  repeated string ids = 1;
+}
+
+message BatchGetUsersResponse {
+  repeated User users = 1;
+  repeated string not_found = 2;
+}
+
+message UserExistsRequest {
+  oneof selector {
+    string id = 1;
+    string email = 2;
+  }
+}
+
+message UserExistsResponse {
+  bool exists = 1;
+}
+
+message ListUsersRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+}
+
+message ListUsersResponse {
+  repeated User users = 1;
+  string next_page_token = 2;
+}
+
+message SearchUsersRequest {
+  string query = 1;
+  Role role = 2;
+  Status status = 3;
+  optional bool verified = 4;
+  string sort = 5;
+  int32 page_size = 6;
+  string page_token = 7;
+}
+
+message SearchUsersResponse {
+  repeated User results = 1;
+  string next_page_token = 2;
+  int64 total_estimate = 3;
+}

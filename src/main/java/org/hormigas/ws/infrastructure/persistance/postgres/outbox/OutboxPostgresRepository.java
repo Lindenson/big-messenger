@@ -1,0 +1,377 @@
+package org.hormigas.ws.infrastructure.persistance.postgres.outbox;
+
+import io.quarkus.reactive.datasource.ReactiveDataSource;
+import io.smallrye.mutiny.Uni;
+import io.vertx.mutiny.pgclient.PgPool;
+import io.vertx.mutiny.sqlclient.Row;
+import io.vertx.mutiny.sqlclient.SqlConnection;
+import io.vertx.mutiny.sqlclient.SqlResult;
+import io.vertx.mutiny.sqlclient.Tuple;
+import io.vertx.pgclient.data.Interval;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
+import org.hormigas.ws.infrastructure.persistance.postgres.OutboxRepository;
+import org.hormigas.ws.infrastructure.persistance.postgres.dto.HistoryRow;
+import org.hormigas.ws.infrastructure.persistance.postgres.dto.Inserted;
+import org.hormigas.ws.infrastructure.persistance.postgres.dto.OutboxMessage;
+import org.hormigas.ws.infrastructure.persistance.postgres.dto.OutboxRow;
+
+import java.time.Duration;
+import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+@Slf4j
+@ApplicationScoped
+public class OutboxPostgresRepository implements OutboxRepository {
+
+    /** Persist pool (default datasource): history+outbox writes. */
+    @Inject
+    PgPool client;
+
+    /** Poller pool (Phase 5b): delivery claim+lease + retract/GC, isolated so persist bursts can't starve
+     *  live delivery. Separate reactive pool over the same Postgres. */
+    @Inject
+    @ReactiveDataSource("poller")
+    PgPool pollerClient;
+
+    // ----------------------------------------------------------------------
+    // insertBatch (OUTBOX)
+    // ----------------------------------------------------------------------
+    @Override
+    public Uni<List<Inserted>> insertOutboxBatch(List<OutboxMessage> batch) {
+        if (batch == null || batch.isEmpty()) return Uni.createFrom().item(Collections.emptyList());
+
+        StringBuilder sql = new StringBuilder(
+                """
+                INSERT INTO outbox
+                 (type, sender_id, recipient_id,
+                  conversation_id, message_id, correlation_id,
+                  sender_ts, sender_tz, server_ts, payload_json, meta_json)
+                VALUES
+                """);
+
+        List<Object> flat = new ArrayList<>();
+
+        for (int i = 0; i < batch.size(); i++) {
+            OutboxMessage m = batch.get(i);
+            if (i > 0) sql.append(",");
+
+            int p = flat.size() + 1;
+
+            sql.append("(")
+                    .append("$").append(p).append(",")     // type
+                    .append("$").append(p + 1).append(",") // sender_id
+                    .append("$").append(p + 2).append(",") // recipient_id
+                    .append("$").append(p + 3).append(",") // conversation_id
+                    .append("$").append(p + 4).append(",") // message_id
+                    .append("$").append(p + 5).append(",") // correlation_id
+                    .append("$").append(p + 6).append(",") // sender_ts
+                    .append("$").append(p + 7).append(",") // sender_tz
+                    .append("$").append(p + 8).append(",") // server_ts
+                    .append("$").append(p + 9).append(",") // payload_json
+                    .append("$").append(p + 10)            // meta_json
+                    .append(")");
+
+            flat.add(m.type());
+            flat.add(m.senderId());
+            flat.add(m.recipientId());
+            flat.add(m.conversationId());
+            flat.add(m.messageId());
+            flat.add(m.correlationId());
+            flat.add(m.senderTimestamp());
+            flat.add(m.senderTimezone());
+            flat.add(m.serverTimestamp());
+            flat.add(m.payloadJson());
+            flat.add(m.metaJson());
+        }
+
+        sql.append(" RETURNING id, message_id");
+
+        Tuple params = Tuple.tuple();
+        flat.forEach(params::addValue);
+
+        return client.preparedQuery(sql.toString())
+                .execute(params)
+                .onItem()
+                .transform(rows -> {
+                    List<Inserted> out = new ArrayList<>();
+                    for (Row r : rows) {
+                        out.add(new Inserted(r.getLong("id"), r.getString("message_id")));
+                    }
+                    return out;
+                });
+    }
+
+    // ----------------------------------------------------------------------
+    // fetchBatchForProcessing
+    // ----------------------------------------------------------------------
+    @Override
+    public Uni<List<OutboxRow>> fetchBatchForProcessing(int batchSize, Duration leaseDuration) {
+        if (batchSize <= 0) batchSize = 50;
+
+        Interval interval = durationToPgIntervalStrict(leaseDuration);
+
+        // Single-statement claim: the CTE picks-and-locks the due rows (SKIP LOCKED for safe
+        // concurrent pollers) and the UPDATE leases them in one round-trip. One statement runs in
+        // its own implicit transaction, so no explicit begin/commit is needed (halves DB round-trips
+        // vs. the previous SELECT-then-UPDATE-in-a-tx).
+        String claimSql = """
+            WITH picked AS (
+                SELECT id FROM outbox
+                WHERE lease_until <= now()
+                ORDER BY id
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE outbox o
+            SET lease_until = now() + ($1::interval),
+                processing_attempts = processing_attempts + 1
+            FROM picked
+            WHERE o.id = picked.id
+            RETURNING o.id, o.type,
+                      o.sender_id, o.recipient_id, o.conversation_id, o.message_id,
+                      o.correlation_id, o.sender_ts, o.sender_tz, o.server_ts,
+                      o.payload_json, o.meta_json, o.created_at, o.lease_until
+            """;
+
+        int finalBatchSize = batchSize;
+        return pollerClient.preparedQuery(claimSql).execute(Tuple.of(interval, finalBatchSize))
+                        .onItem().transform(updated -> {
+                                        List<OutboxRow> list = new ArrayList<>();
+                                        for (Row r : updated) {
+                                            list.add(new OutboxRow(
+                                                    r.getLong("id"),
+                                                    r.getString("sender_id"),
+                                                    r.getString("recipient_id"),
+                                                    r.getString("conversation_id"),
+                                                    r.getString("message_id"),
+                                                    r.getString("correlation_id"),
+                                                    r.getLong("sender_ts"),
+                                                    r.getString("sender_tz"),
+                                                    r.getLong("server_ts"),
+                                                    r.getString("type"),
+                                                    r.getString("payload_json"),
+                                                    r.getString("meta_json"),
+                                                    r.getOffsetDateTime("created_at").toInstant(),
+                                                    r.getOffsetDateTime("lease_until").toInstant()
+                                            ));
+                                        }
+                                        return list;
+                                    });
+    }
+
+    // ----------------------------------------------------------------------
+    // insertHistoryAndOutboxTransactional
+    // ----------------------------------------------------------------------
+    @Override
+    public Uni<List<Inserted>> insertHistoryAndOutboxTransactional(
+            List<HistoryRow> historyRows,
+            List<OutboxMessage> outboxBatch
+    ) {
+        return client.withTransaction(conn -> {
+
+            Uni<Void> insertHistory = Uni.createFrom().voidItem();
+
+            if (historyRows != null && !historyRows.isEmpty()) {
+
+                StringBuilder hsql = new StringBuilder("""
+                    INSERT INTO message_history
+                    (message_id, conversation_id, sender_id, recipient_id,
+                     order_id, payload_json, created_at, client_message_id)
+                    VALUES
+                    """);
+
+                List<Object> flat = new ArrayList<>();
+
+                for (int i = 0; i < historyRows.size(); i++) {
+                    HistoryRow h = historyRows.get(i);
+
+                    if (i > 0) hsql.append(",");
+
+                    int p = flat.size() + 1;
+
+                    hsql.append("(")
+                            .append("$").append(p).append(",")     // message_id
+                            .append("$").append(p + 1).append(",") // conversation_id
+                            .append("$").append(p + 2).append(",") // sender_id
+                            .append("$").append(p + 3).append(",") // recipient_id
+                            .append("$").append(p + 4).append(",") // order_id
+                            .append("$").append(p + 5).append("::jsonb,") // payload_json
+                            .append("$").append(p + 6).append(",") // created_at
+                            .append("$").append(p + 7)             // client_message_id
+                            .append(")");
+
+                    flat.add(h.messageId());
+                    flat.add(h.conversationId());
+                    flat.add(h.senderId());
+                    flat.add(h.recipientId());
+                    flat.add(h.orderId());
+                    flat.add(h.payloadJson());
+                    flat.add(h.createdAt().atOffset(ZoneOffset.UTC));
+                    flat.add(h.clientMessageId());
+                }
+
+                hsql.append(" RETURNING id");
+
+                Tuple params = Tuple.tuple();
+                flat.forEach(params::addValue);
+
+                insertHistory =
+                        conn.preparedQuery(hsql.toString()).execute(params).replaceWithVoid();
+            }
+
+            return insertHistory
+                    .flatMap(v -> insertBatchInTx(conn, outboxBatch))
+                    .onFailure().invoke(er -> log.error("Error inserting history", er));
+        });
+    }
+
+    // ----------------------------------------------------------------------
+    // deleteProcessedByIds
+    // ----------------------------------------------------------------------
+    @Override
+    public Uni<Integer> deleteProcessedByIds(List<String> messageIds) {
+        if (messageIds == null || messageIds.isEmpty())
+            return Uni.createFrom().item(0);
+
+        String sql = "DELETE FROM outbox WHERE message_id = ANY($1)";
+
+        return pollerClient.preparedQuery(sql)
+                .execute(Tuple.of(toStringArray(messageIds)))
+                .onItem().transform(SqlResult::rowCount);
+    }
+
+    // ----------------------------------------------------------------------
+    // deleteOlderThan
+    // ----------------------------------------------------------------------
+    @Override
+    public Uni<Integer> deleteOlderThan(long idThreshold) {
+        String sql = "DELETE FROM outbox WHERE id < $1";
+
+        return pollerClient.preparedQuery(sql)
+                .execute(Tuple.of(idThreshold))
+                .onItem().transform(SqlResult::rowCount);
+    }
+
+    @Override
+    public Uni<Long> countRows() {
+        // Observability-only depth probe, sampled off the hot path (every collector tick, ~10s). The
+        // outbox is GC-trimmed so it stays small and this count(*) is cheap; not a per-scrape read.
+        return pollerClient.query("SELECT count(*) AS n FROM outbox")
+                .execute()
+                .map(rows -> rows.iterator().next().getLong("n"))
+                .onFailure().recoverWithItem(-1L);
+    }
+
+    @Override
+    public Uni<java.util.Map<String, List<Long>>> pendingByRecipient() {
+        // Every still-buffered row is a not-yet-collected (pending) message; the outbox is the
+        // durable source of truth used to rehydrate the Tetris safe-delete state after loss.
+        return pollerClient.query("SELECT recipient_id, id FROM outbox")
+                .execute()
+                .map(rows -> {
+                    java.util.Map<String, List<Long>> byRecipient = new java.util.HashMap<>();
+                    for (Row r : rows) {
+                        byRecipient.computeIfAbsent(r.getString("recipient_id"), k -> new ArrayList<>())
+                                .add(r.getLong("id"));
+                    }
+                    return byRecipient;
+                });
+    }
+
+    // ----------------------------------------------------------------------
+    // helpers
+    // ----------------------------------------------------------------------
+    private Uni<List<Inserted>> insertBatchInTx(SqlConnection conn, List<OutboxMessage> batch) {
+        if (batch == null || batch.isEmpty()) return Uni.createFrom().item(Collections.emptyList());
+
+        StringBuilder sql = new StringBuilder("""
+        INSERT INTO outbox
+         (type, sender_id, recipient_id,
+          conversation_id, message_id, correlation_id,
+          sender_ts, sender_tz, server_ts, payload_json, meta_json)
+        VALUES
+        """);
+
+        List<Object> flat = new ArrayList<>();
+
+        for (int i = 0; i < batch.size(); i++) {
+            OutboxMessage m = batch.get(i);
+            if (i > 0) sql.append(",");
+
+            int p = flat.size() + 1;
+
+            sql.append("(")
+                    .append("$").append(p).append(",")
+                    .append("$").append(p + 1).append(",")
+                    .append("$").append(p + 2).append(",")
+                    .append("$").append(p + 3).append(",")
+                    .append("$").append(p + 4).append(",")
+                    .append("$").append(p + 5).append(",")
+                    .append("$").append(p + 6).append(",")
+                    .append("$").append(p + 7).append(",")
+                    .append("$").append(p + 8).append(",")
+                    .append("$").append(p + 9).append(",")
+                    .append("$").append(p + 10)
+                    .append(")");
+
+            flat.add(m.type());
+            flat.add(m.senderId());
+            flat.add(m.recipientId());
+            flat.add(m.conversationId());
+            flat.add(m.messageId());
+            flat.add(m.correlationId());
+            flat.add(m.senderTimestamp());
+            flat.add(m.senderTimezone());
+            flat.add(m.serverTimestamp());
+            flat.add(m.payloadJson());
+            flat.add(m.metaJson());
+        }
+
+        sql.append(" RETURNING id, message_id");
+
+        Tuple params = Tuple.tuple();
+        flat.forEach(params::addValue);
+
+        return conn.preparedQuery(sql.toString())
+                .execute(params)
+                .onItem()
+                .transform(rows -> {
+                    List<Inserted> out = new ArrayList<>();
+                    for (Row r : rows) {
+                        out.add(new Inserted(r.getLong("id"), r.getString("message_id")));
+                    }
+                    return out;
+                });
+    }
+
+    private static Long[] toLongArray(List<Long> ids) {
+        return ids.toArray(new Long[0]);
+    }
+
+    private static String[] toStringArray(List<String> ids) {
+        return ids.toArray(new String[0]);
+    }
+
+    static Interval durationToPgIntervalStrict(Duration d) {
+        if (d == null) {
+            throw new IllegalArgumentException("leaseDuration must not be null");
+        }
+
+        Duration max = Duration.ofHours(24);
+        if (d.compareTo(max) > 0) {
+            throw new IllegalArgumentException("leaseDuration must be <= 24 hours");
+        }
+
+        if (d.isNegative() || d.isZero()) {
+            d = Duration.ofSeconds(1);
+        } else if (d.compareTo(Duration.ofSeconds(1)) < 0) {
+            d = Duration.ofSeconds(1);
+        }
+
+        return Interval.of(d);
+    }
+}

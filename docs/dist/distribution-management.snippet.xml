@@ -1,0 +1,22 @@
+<!--
+  Add to EACH module POM (messenger-hl-contracts / messenger-hl / messenger-hl-redis).
+  Replace OWNER and the repo name in the URL with the module's own GitHub repo.
+  <id>github</id> must match a <server><id>github</id> in settings.xml (credentials).
+
+  GitHub Packages Maven feeds are repo-scoped, so each module publishes to its own repo's feed:
+    contracts  -> maven.pkg.github.com/OWNER/messenger-hl-contracts
+    hl         -> maven.pkg.github.com/OWNER/messenger-hl
+    hl-redis   -> maven.pkg.github.com/OWNER/messenger-hl-redis
+-->
+<distributionManagement>
+    <repository>
+        <id>github</id>
+        <name>GitHub Packages</name>
+        <url>https://maven.pkg.github.com/OWNER/messenger-hl</url>
+    </repository>
+    <snapshotRepository>
+        <id>github</id>
+        <name>GitHub Packages</name>
+        <url>https://maven.pkg.github.com/OWNER/messenger-hl</url>
+    </snapshotRepository>
+</distributionManagement>

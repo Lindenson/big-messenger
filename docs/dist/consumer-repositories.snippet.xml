@@ -1,0 +1,28 @@
+<!--
+  Add to the APP pom.xml so Maven resolves the published HL artifacts from GitHub Packages.
+  One <repository> per module feed (GitHub Packages is repo-scoped). Each <id> must have a matching
+  <server> in settings.xml. Replace OWNER.
+
+  Pair with the BOM import in <dependencyManagement> (see messenger-hl-bom.pom.xml header), then declare
+  the three dependencies WITHOUT <version>.
+-->
+<repositories>
+    <repository>
+        <id>github-hl-contracts</id>
+        <url>https://maven.pkg.github.com/OWNER/messenger-hl-contracts</url>
+        <releases><enabled>true</enabled></releases>
+        <snapshots><enabled>true</enabled></snapshots>
+    </repository>
+    <repository>
+        <id>github-hl</id>
+        <url>https://maven.pkg.github.com/OWNER/messenger-hl</url>
+        <releases><enabled>true</enabled></releases>
+        <snapshots><enabled>true</enabled></snapshots>
+    </repository>
+    <repository>
+        <id>github-hl-redis</id>
+        <url>https://maven.pkg.github.com/OWNER/messenger-hl-redis</url>
+        <releases><enabled>true</enabled></releases>
+        <snapshots><enabled>true</enabled></snapshots>
+    </repository>
+</repositories>

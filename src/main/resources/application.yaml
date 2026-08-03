@@ -1,0 +1,307 @@
+"%prod":
+  quarkus:
+    websockets-next:
+      server:
+        max-message-size: 65536
+        metrics:
+          enabled: true
+        auto-ping-interval: 10s
+
+    # gRPC client for the Identity Directory Service (KratosGate IDS). Reached by
+    # name on the shared backend network; plaintext on the private network (IDS is
+    # not exposed publicly). Backs GrpcClientDirectory (prod profile).
+    grpc:
+      clients:
+        ids:
+          host: ${IDS_GRPC_HOST:ids}
+          port: ${IDS_GRPC_PORT:9090}
+          plain-text: true
+
+    datasource:
+      db-kind: postgresql
+      username: ${DB_USER:ant}
+      password: ${DB_PASSWORD:ant}
+      jdbc:
+        url: jdbc:postgresql://${DB_HOST:postgres}:${DB_PORT:5432}/${DB_NAME:hormigasdb}
+      reactive:
+        url: postgres://${DB_HOST:postgres}:${DB_PORT:5432}/${DB_NAME:hormigasdb}
+        # Persist pool: serves the group-commit writes (history+outbox tx) and read-receipt writes.
+        # Keep processing.messages.*.max-concurrent-batches ≤ this (enforced by ConfigValidator).
+        max-size: ${DB_POOL_PERSIST:24}
+      # Second reactive pool for the outbox poller — delivery reads (claim+lease), retract & GC. Isolated
+      # from the persist pool so a persist burst (Phase 5b finding) can never starve live delivery. Same
+      # Postgres, separate connections; reactive-only (no JDBC/Flyway/ORM). Total conns = persist + poller.
+      "poller":
+        db-kind: postgresql
+        username: ${DB_USER:ant}
+        password: ${DB_PASSWORD:ant}
+        jdbc: false
+        reactive:
+          url: postgres://${DB_HOST:postgres}:${DB_PORT:5432}/${DB_NAME:hormigasdb}
+          max-size: ${DB_POOL_POLLER:12}
+
+    flyway:
+      migrate-at-start: true
+      baseline-on-migrate: true
+      locations:
+        - db/migration
+
+    redis:
+      hosts: redis://${REDIS_HOST:redis}:${REDIS_PORT:6379}
+      timeout: 5s
+      # Sized for connection-churn storms: when many WebSocket sessions close at once, each disconnect
+      # fires presence + Tetris-cleanup + idempotency ops at Redis. The Vert.x defaults (pool 6 / wait
+      # queue 24) reject the burst with ConnectionPoolTooBusyException. See docs/PERFORMANCE.md.
+      max-pool-size: 24
+      max-pool-waiting: 2048
+
+    hibernate-orm:
+      database:
+        # Flyway owns the schema (db/migration V2–V10). validate (not update) so the ORM never silently
+        # patches the schema past the migrations. There are no @Entity classes today (persistence is raw
+        # reactive SQL), so this validates nothing — but it locks the intent if entities are ever added.
+        generation: validate
+      sql-load-script: no-file
+
+    log:
+      level: WARN
+      category:
+        "org.hibernate":
+          level: WARN
+          min-level: WARN
+        # Our own code logs its lifecycle/shutdown/drain at INFO — keep it visible above the WARN floor.
+        "org.hormigas":
+          level: INFO
+      # Console: structured, one line per event (%c{2.} = abbreviated category, %t = thread).
+      console:
+        format: "%d{yyyy-MM-dd HH:mm:ss,SSS} %-5p [%c{2.}] (%t) %X %s%e%n"
+      # Rotating file handler for ops: JSON-free plain text, size-based rotation with a bounded backlog so
+      # disk never fills. Path is env-overridable for containerized deploys (mount a volume at /var/log).
+      file:
+        enable: true
+        path: ${LOG_FILE:messenger.log}   # relative default (writable anywhere); deploys set LOG_FILE=/var/log/messenger/messenger.log
+        format: "%d{yyyy-MM-dd HH:mm:ss,SSS} %-5p [%c{2.}] (%t) %X %s%e%n"
+        rotation:
+          max-file-size: 20M          # rotate a file once it reaches this size
+          max-backup-index: 10        # keep at most 10 rotated files (~200M cap total)
+          file-suffix: .yyyy-MM-dd     # date-stamp rotated files
+          rotate-on-boot: true
+
+    micrometer:
+      enabled: true
+      export:
+        prometheus:
+          enabled: true
+          path: /q/metrics
+
+    # OpenAPI spec at /q/openapi (+ Swagger UI at /q/swagger-ui, force-included in prod for ops).
+    smallrye-openapi:
+      info-title: Hormigas Messenger API
+      info-version: 1.0.0
+      info-description: Master↔client chat — REST (chats/messages/freeze/receipts/system-notify). WebSocket protocol is documented in the README.
+    swagger-ui:
+      always-include: true
+
+
+  processing:
+    # Cross-cutting REST rate limiting (per caller × endpoint-group). Every /api/* endpoint uses
+    # default-limit; a @RateLimit("group")-annotated resource uses its group. Single-instance (in-memory).
+    rate-limit:
+      enabled: true
+      bucket-cache-max: 200000   # max distinct (group,caller) buckets held; ↑ for many callers, ↓ to bound memory
+      bucket-idle-minutes: 10    # evict a caller's bucket after this idle time (state resets)
+      default-limit:
+        permits-per-second: 20   # sustained rate for any endpoint without a @RateLimit group
+        burst: 40                # burst allowance (bucket capacity)
+      groups:
+        # attachments are the strictest (presigned-upload provisioning is expensive)
+        attachments:
+          permits-per-second: 1
+          burst: 5
+        # admin console — moderate
+        admin:
+          permits-per-second: 5
+          burst: 15
+    messages:
+      # Re-subscribe backoff shared by the inbound/outbound publishers and the group-commit batchers:
+      # on a terminal stream fault they retry indefinitely with this exponential backoff (transient
+      # fault never permanently disables a stream). ↑ = calmer under repeated faults; ↓ = faster recovery.
+      stream-retry:
+        min-backoff-ms: 200
+        max-backoff-ms: 5000
+      inbound:
+        queue-size: 8000        # inbound backpressure gate; over this, a send is rejected (SERVICE_OUT overloaded). ↑ absorbs bursts (more memory), ↓ sheds sooner
+        delivery-concurrency: 32 # max concurrent routeIn flows (PARALLEL_BOUNDED). Inbound throughput lever: μ≈concurrency/service-time. ~32 covers ~2000/s at ~10ms/msg
+        # Group-commit of the inbound persist (plan B). Publisher runs PARALLEL_BOUNDED; these coalesce
+        # concurrent history+outbox writes into one tx per batch and run several tx concurrently
+        # to fill the otherwise ~95%-idle DB pool (keep max-concurrent-batches ≤ DB pool size = 24).
+        # Tuned 2026-07-12 under load: small 64-row batches flushed as ~2-row txs (linger firing before
+        # coalescing) throttled the drain and maxed the inbound queue; bigger batch + longer linger +
+        # more concurrent txs raise persist throughput so the inbound queue stops filling.
+        persist-batch:
+          max-size: 256
+          linger-ms: 20
+          max-concurrent-batches: 16
+      # In-process L1 cache for the hot membership/block lookup the send-guard does on every inbound
+      # message (Phase 2, 4.1). Write-through invalidation on block/unblock/soft-delete + this TTL
+      # backstop. Single-instance; a distributed Redis L2 is a documented future (multi-instance/sharding).
+      conversation-cache:
+        max-size: 100000
+        ttl-seconds: 60
+      # Group-commit of read-status writes (READ_IN), mirroring persist-batch: READ receipts hit the DB
+      # only in batches. Overflow sheds whole batches gracefully (onOverflow drop) — never stalls.
+      read-batch:
+        max-size: 64
+        linger-ms: 10
+        max-concurrent-batches: 4
+      # Offline-recipient notification publisher (ADR-007 producer side): on a durable chat/system message
+      # that can't be delivered live (recipient has no open WS session), emit a coalesced event to Kafka
+      # topic chat.offline.notify for the Go notification service. Coalescing collapses a burst to one push
+      # per (recipient, conversation) per window; knobs mirror read-batch. Best-effort — never blocks/fails
+      # delivery (the outbox is the durable guarantee). Set enabled=false to disable emission entirely.
+      offline-push:
+        enabled: true
+        topic: chat.offline.notify
+        max-size: 64
+        linger-ms: 10
+        max-concurrent-batches: 4
+      # Outbound poller (delivery of the outbox). polling-ms is a Quarkus Duration string ("1000ms"/"1s").
+      # Feed rate ceiling ≈ batch-size ÷ polling-ms (4000 ÷ 0.5s = 8000/s), actually bounded by ingest.
+      outbound:
+        batch-size: 4000        # rows fetched per poll; ↑ higher delivery throughput, ↓ lighter DB reads
+        queue-size: 5000        # outbound backpressure gate (poller skips fetch while non-empty → peak ≈ batch-size)
+        polling-ms: "500ms"     # base poll interval (Duration string)
+        delivery-concurrency: 32 # max concurrent WS deliveries (PARALLEL_BOUNDED); with the poller feed, keeps up with ingest
+      # Inbound live-delivery FAST PATH — the dedicated publisher AsyncHandoffStage emits into, so recipient
+      # delivery runs on its own subscription/threads decoupled from inbound persist. Outbox poller is the
+      # catch-up path if this sheds. Own backpressure (queue gate + bounded-parallel), like outbound.
+      fast-delivery:
+        queue-size: 5000         # fast-path backpressure gate; over this the hand-off sheds (poller delivers)
+        delivery-concurrency: 32 # max concurrent WS deliveries on the fast path (PARALLEL_BOUNDED)
+      # Adaptive poll-delay regulator: slows the poller under drops, recovers when stable.
+      feedback:
+        additional-ms: 1000     # base added poll delay
+        adjustment-factor: 2.0  # growth on drops — MUST be >1 (slow down under overload)
+        recovery-factor: 0.5    # decay toward base when stable — MUST be <1
+        max-ms: 30000           # cap on the added delay (≥ additional-ms)
+      # Delivery retry to a client socket (transient send failures).
+      channel:
+        retry: true
+        min-backoff-ms: 300     # ↑ calmer retries, ↓ faster; keep min ≤ max
+        max-backoff-ms: 1000
+        max-retries: 3
+      # Per-connection WS flow control (token bucket) — the built-in anti-DoS / anti-flood guard.
+      credits:
+        max-value: 1000         # burst allowance per connection
+        refill-rate-per-s: 100  # sustained per-connection send rate; aggregate ceiling ≈ connections × this
+      # Outbox GC (watermark/Tetris) sweep cadence (Duration string).
+      collector:
+        every-s: "10s"
+      # NB: the watermark/outbox observability sampler cadence is intentionally NOT under this mapped
+      # `processing.messages` namespace (an unknown leaf here fails boot with SRCFG00050). It lives as the
+      # @Scheduled default `messenger.metrics.sample-every:10s` in TetrisMetricsScheduler; override via
+      # -Dmessenger.metrics.sample-every / env only if a non-default cadence is needed.
+      # Redis idempotency dedup window (in-progress marker TTL). ≥ typical message processing time.
+      idempotent:
+        ttl-seconds: 30
+      # Durable store selector. "redis" wires the Redis idempotency/presence/tetris beans; anything else disables them.
+      storage:
+        service: redis
+    attachments:
+      max-size-bytes: 26214400   # 25 MiB cap (enforced twice: declared at request + actual object size at confirm)
+      orphan-age-seconds: 3600   # reclaim a PENDING upload that never confirmed after 1h (must exceed minio.upload-ttl-seconds)
+      cleanup-batch: 200         # orphan-reclaim page size per tick; ↑ drains faster (heavier), ↓ gentler
+      cleanup-every: 15m         # orphan-reclaim sweep cadence (Duration string)
+      # Allowed content-types (exact, or a "type/*" wildcard). Absent = allow all. Set a whitelist in
+      # prod to lock down, e.g.:  allowed-content-types: "image/*,application/pdf,text/plain"
+      # (rejected at request with 415).
+
+    # Session reapers (prod). Cadences are Duration strings.
+    session:
+      idle-timeout-ms: 35000        # silent-connection cutoff (missed pings); ↑ tolerates flaky links, ↓ frees phantom-online sooner
+      max-pending: 20               # per-recipient SUSTAINED un-ACKed backlog before force-disconnect. A healthy client ACKs continuously so its pending stays ~single digits; >20 at a reaper check (overload-reaper-every) means the client is effectively stuck/dead and is pinning the global GC watermark — reap it fast so GC (and every other recipient's rows) is not held hostage. High values (1000) never fire and let one stuck online client freeze GC for the whole outbox. Momentary delivery bursts that drain between reaper checks do not trip this (it is the sustained depth at check time, not an instantaneous cap).
+      overload-kick-batch: 100      # max heavy clients kicked per overload sweep; ↑ clears faster (burstier), ↓ smoother
+      reaper-every: 15s             # liveness (idle) sweep cadence
+      overload-reaper-every: 20s    # overload (backlog) sweep cadence
+      presence-refresh-every: 30s   # re-assert local sessions into Redis presence (self-heal after a Redis wipe)
+
+    # Graceful shutdown: on SIGTERM, close inbound + drain the group-commit batchers before stopping.
+    shutdown:
+      drain-timeout-ms: 5000        # max wait per batcher for in-flight commits; un-committed → redelivered
+
+    # Dead-letter retract sweep (Strategy C, ADR-014).
+    deadletter:
+      cleanup-batch: 500            # confirmed-set drain page size per sweep; ↑ retracts faster (heavier), ↓ gentler
+      cleanup-every: 30s            # sweep cadence (Duration string)
+
+    # History retention sweep (UC-U23, FR-RET-04/05). Two classes: normal history vs longer-lived frozen.
+    retention:
+      history-days: 90              # purge normal history older than this (frozen excluded)
+      frozen-days: 365              # longer TTL for frozen (contract) messages; must be ≥ history-days
+      every: 24h                    # retention sweep cadence (Duration string)
+
+  # Inter-service Kafka integration (ADR-007): consume order.events.
+  # NB: the default MUST be a resolvable host. An unresolvable bootstrap host fails Kafka-consumer
+  # construction and hard-fails startup (not just health). `localhost:9092` always resolves, so a
+  # broker-less env (e2e/Karate, or prod before the broker is provisioned) still boots — the consumer
+  # just retries connecting in the background. Real prod sets KAFKA_BOOTSTRAP_SERVERS to the broker.
+  kafka:
+    bootstrap:
+      servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+  mp:
+    messaging:
+      incoming:
+        order-events-in:
+          connector: smallrye-kafka
+          topic: order.events
+          group:
+            id: hormiga-messenger
+          value:
+            deserializer: org.apache.kafka.common.serialization.StringDeserializer
+          auto:
+            offset:
+              reset: earliest
+          # at-least-once + idempotent handlers; failed processing nacks → redelivery.
+          failure-strategy: fail
+          # The Order `order.events` topic/broker is not provisioned yet (blocked on the Order side),
+          # and the e2e/Karate env has no Kafka. Don't let an absent broker flip readiness DOWN — the
+          # connector retries connecting in the background. Re-enable once the broker is live in the env.
+          health-readiness-enabled: false
+      outgoing:
+        # Offline-recipient notification producer → topic chat.offline.notify (consumed by the Go
+        # notification service). Key + value are String (recipientId key set per-record via
+        # OutgoingKafkaRecordMetadata; the topic likewise comes from processing.messages.offline-push.topic
+        # so the mapped config is the single source of truth). Same absent-broker tolerance as the consumer.
+        offline-push-out:
+          connector: smallrye-kafka
+          topic: chat.offline.notify
+          key:
+            serializer: org.apache.kafka.common.serialization.StringSerializer
+          value:
+            serializer: org.apache.kafka.common.serialization.StringSerializer
+          # Broker may not be provisioned yet (or absent in e2e/Karate) — don't flip readiness DOWN.
+          health-readiness-enabled: false
+          # Fire-and-forget from the delivery path: don't block the emitter on full write completion.
+          waitForWriteCompletion: false
+
+  # Order-event type contract (ASSUMED — reconcile with the Order team). Override without code change.
+  messenger:
+    order-events:
+      type:
+        master-interested: order.master.interested
+        contract-reached: order.contract.concluded
+
+  # Attachments (concept §10, ADR-010): two-phase presigned upload to MinIO. The endpoint MUST be a
+  # host clients can also reach (MINIO_PUBLIC_URL split-horizon); e2e shares localhost:9000. The client
+  # is lazy, so startup never depends on MinIO being up.
+  minio:
+    endpoint: ${MINIO_ENDPOINT:http://localhost:9000}
+    access-key: ${MINIO_ACCESS_KEY:hormiga}
+    secret-key: ${MINIO_SECRET_KEY:hormiga123}
+    bucket: ${MINIO_BUCKET:messenger-attachments}
+    upload-ttl-seconds: 600
+    download-ttl-seconds: 300
+
+
+
+

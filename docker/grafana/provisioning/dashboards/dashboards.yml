@@ -1,0 +1,11 @@
+apiVersion: 1
+providers:
+  - name: HormigaMessanger
+    orgId: 1
+    folder: HormigaMessanger
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      # docs/ops is mounted here by docker-compose.yml — ships grafana-messenger-dashboard.json.
+      path: /var/lib/grafana/dashboards

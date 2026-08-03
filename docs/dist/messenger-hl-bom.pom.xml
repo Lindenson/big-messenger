@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  messenger-hl BOM — pins the versions of the extracted HL artifacts so consumers import ONE thing and
+  declare the dependencies without versions. Lives in the messenger-hl-contracts repo as bom/pom.xml
+  (avoids a dedicated 5th repo). Bump <version> + the pinned versions on each coordinated release.
+
+  Consumer usage (e.g. the app pom):
+    <dependencyManagement>
+      <dependencies>
+        <dependency>
+          <groupId>org.hormigas</groupId><artifactId>messenger-hl-bom</artifactId>
+          <version>1.1.0</version><type>pom</type><scope>import</scope>
+        </dependency>
+      </dependencies>
+    </dependencyManagement>
+    then, without versions:
+    <dependency><groupId>org.hormigas</groupId><artifactId>messenger-hl</artifactId></dependency>
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>org.hormigas</groupId>
+    <artifactId>messenger-hl-bom</artifactId>
+    <version>1.2.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+    <name>messenger-hl-bom</name>
+    <description>Version alignment for the messenger-hl high-performance toolkit.</description>
+
+    <properties>
+        <messenger-hl.version>1.2.0-SNAPSHOT</messenger-hl.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.hormigas</groupId>
+                <artifactId>messenger-hl-contracts</artifactId>
+                <version>${messenger-hl.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.hormigas</groupId>
+                <artifactId>messenger-hl</artifactId>
+                <version>${messenger-hl.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.hormigas</groupId>
+                <artifactId>messenger-hl-redis</artifactId>
+                <version>${messenger-hl.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <!-- Where the BOM itself is published (GitHub Packages, contracts repo feed). -->
+    <distributionManagement>
+        <repository>
+            <id>github</id>
+            <url>https://maven.pkg.github.com/OWNER/messenger-hl-contracts</url>
+        </repository>
+        <snapshotRepository>
+            <id>github</id>
+            <url>https://maven.pkg.github.com/OWNER/messenger-hl-contracts</url>
+        </snapshotRepository>
+    </distributionManagement>
+</project>

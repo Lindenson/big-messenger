@@ -1,0 +1,51 @@
+# Copy into each library repo as .github/workflows/publish-on-tag.yml
+# (You must commit this yourself — the automation token cannot push to .github/workflows/.)
+#
+# Builds and publishes the module's artifact to GitHub Packages on a vX.Y.Z tag,
+# and publishes -SNAPSHOT on every push to main so downstream repos get fresh builds.
+#
+# AUTH — one secret, PACKAGES_TOKEN, used for BOTH publishing this module and reading the
+# upstream messenger-hl-contracts package (cross-repo private reads that the built-in
+# GITHUB_TOKEN cannot do on a personal account). Create it once:
+#   GitHub -> Settings -> Developer settings -> Personal access tokens (classic)
+#     scopes: write:packages, read:packages   (write:packages implies read)
+#   Add it as a repository (or account/org) secret named PACKAGES_TOKEN in each of the 3 repos.
+# The single Maven server id "github" covers both <distributionManagement> (publish) and the
+# downstream <repositories> (read contracts), so one credential is enough.
+name: publish
+
+on:
+  push:
+    branches: [main]        # -> -SNAPSHOT
+    tags: ['v*']            # -> release version
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          server-id: github            # matches <distributionManagement> AND the contracts <repositories> id
+          server-username: MAVEN_USERNAME
+          server-password: MAVEN_TOKEN
+
+      # A release tag must publish a release version, not -SNAPSHOT. If the tag is v1.2.0,
+      # stamp the POM to 1.2.0 before deploy. Pushes to main keep the -SNAPSHOT in the POM.
+      - name: Set release version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: mvn -B versions:set -DnewVersion="${GITHUB_REF_NAME#v}" -DgenerateBackupPoms=false
+
+      # ubuntu-latest ships Maven; the extracted module repos have no mvnw wrapper.
+      - name: Build & publish
+        run: mvn -B -Djacoco.skip=true deploy
+        env:
+          MAVEN_USERNAME: ${{ github.repository_owner }}
+          MAVEN_TOKEN: ${{ secrets.PACKAGES_TOKEN }}

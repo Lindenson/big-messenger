@@ -1,0 +1,132 @@
+# HormigaMessanger — full local/staging stack.
+#   cp docker/.env.example docker/.env    # then edit secrets
+#   docker compose -f docker/docker-compose.yml up -d --build
+#
+# Brings up the app + its four dependencies + Prometheus/Grafana. To run against
+# EXTERNAL dependencies instead, delete the ones you don't want here and point the
+# matching *_HOST/ENDPOINT vars in .env at your hosts.
+#
+# ⚠ SECURITY: this exposes the app on :8080 for convenience. In real deployments the
+# service MUST sit behind the Ory edge (Oathkeeper) — it trusts X-User-*/X-Role headers,
+# so a directly-reachable :8080 lets anyone forge `X-Role: ADMIN`. Do NOT publish 8080 publicly.
+
+name: hormiga-messenger
+
+services:
+  messenger:
+    build:
+      context: ..                     # repo root — Dockerfile needs src/ + pom.xml
+      dockerfile: docker/Dockerfile
+    image: hormiga-messenger:local
+    depends_on:
+      postgres:  { condition: service_healthy }
+      redis:     { condition: service_healthy }
+      minio:     { condition: service_healthy }
+    env_file: [ .env ]
+    environment:
+      # Memory guards (also baked into the image; kept here so they're visible/tunable).
+      MALLOC_ARENA_MAX: "2"
+      JAVA_OPTS: "-Dquarkus.http.host=0.0.0.0 -Djava.util.logging.manager=org.jboss.logmanager.LogManager -XX:+UseG1GC -Xmx2g -XX:MaxDirectMemorySize=1g -XX:MaxMetaspaceSize=256m -XX:ReservedCodeCacheSize=256m"
+    mem_limit: 3g                      # ceiling; the JVM guards keep VIRT ~3.2G / RSS ~0.8G
+    ports:
+      - "8080:8080"                    # ⚠ dev only — front with Oathkeeper in prod
+    volumes:
+      - messenger-logs:/var/log/messenger
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${DB_NAME:-hormigasdb}
+      POSTGRES_USER: ${DB_USER:-ant}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-ant}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-ant} -d ${DB_NAME:-hormigasdb}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-hormiga}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-hormiga123}
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9000:9000"                    # S3 API (also the presigned-URL host for clients)
+      - "9001:9001"                    # MinIO console
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # One-shot: create the attachments bucket, then exit.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio: { condition: service_healthy }
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ACCESS_KEY:-hormiga} ${MINIO_SECRET_KEY:-hormiga123} &&
+      mc mb --ignore-existing local/${MINIO_BUCKET:-messenger-attachments} &&
+      echo 'bucket ready';
+      "
+    restart: "no"
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    depends_on: [ prometheus ]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"      # dev convenience; disable in prod
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../docs/ops:/var/lib/grafana/dashboards:ro   # ships grafana-messenger-dashboard.json
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
+  # ── OPTIONAL: Kafka broker for order.events. Enable with:  --profile kafka ──
+  broker:
+    image: redpandadata/redpanda:v24.1.2
+    profiles: [ kafka ]
+    command:
+      - redpanda start
+      - --smp 1
+      - --overprovisioned
+      - --kafka-addr PLAINTEXT://0.0.0.0:29092
+      - --advertise-kafka-addr PLAINTEXT://broker:29092
+    ports:
+      - "29092:29092"
+    restart: unless-stopped
+
+volumes:
+  pg-data:
+  minio-data:
+  grafana-data:
+  messenger-logs:

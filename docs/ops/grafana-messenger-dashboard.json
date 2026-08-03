@@ -1,0 +1,162 @@
+{
+  "__comment": "Hormiga Messenger — ops dashboard. Import into Grafana (Prometheus datasource scraping /q/metrics). Metric names are the Micrometer→Prometheus names emitted by the app; the persist/read batch series come from GroupCommitBatcher's metricPrefix. Panels assume a datasource variable ${DS_PROM}.",
+  "title": "Hormiga Messenger",
+  "uid": "hormiga-messenger",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "10s",
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROM",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "label": "Prometheus"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Ingest — persisted msg/s (batch item rate)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "rate(messenger_persist_batch_size_sum[1m])", "legendFormat": "persisted items/s" },
+        { "expr": "rate(messenger_persist_batch_flushes_total[1m])", "legendFormat": "batch commits/s" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Delivery — published / dropped / failed per s",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "rate(messenger_outbound_published_total[1m])", "legendFormat": "published/s" },
+        { "expr": "rate(messenger_outbound_dropped_total[1m])", "legendFormat": "dropped/s" },
+        { "expr": "rate(messenger_outbound_failed_total[1m])", "legendFormat": "failed/s" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Backpressure — shed items/s (persist + read) [should be 0]",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "rate(messenger_persist_batch_shed_total[1m])", "legendFormat": "persist shed/s" },
+        { "expr": "rate(messenger_read_batch_shed_total[1m])", "legendFormat": "read shed/s" },
+        { "expr": "rate(messenger_persist_batch_fallbacks_total[1m])", "legendFormat": "persist fallbacks/s" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Batch flush latency (p99 / max, persist)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "rate(messenger_persist_batch_flush_seconds_sum[1m]) / rate(messenger_persist_batch_flush_seconds_count[1m])", "legendFormat": "mean flush" },
+        { "expr": "messenger_persist_batch_flush_seconds_max", "legendFormat": "max flush" },
+        { "expr": "rate(messenger_persist_batch_size_sum[1m]) / rate(messenger_persist_batch_size_count[1m])", "legendFormat": "avg batch size" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Outbound queue depth",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "messenger_outbound_queue_size_max", "legendFormat": "outbound queue max" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Resource pool wait (DB / Redis) — seconds",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "sql_pool_queue_delay_seconds_max", "legendFormat": "DB pool wait max" },
+        { "expr": "redis_pool_queue_delay_seconds_max", "legendFormat": "Redis pool wait max" },
+        { "expr": "redis_pool_queue_size", "legendFormat": "Redis queued" }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "JVM heap used",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "sum(jvm_memory_used_bytes{area=\"heap\"})", "legendFormat": "heap used" },
+        { "expr": "sum(jvm_memory_committed_bytes{area=\"heap\"})", "legendFormat": "heap committed" }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "GC pause rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "rate(jvm_gc_pause_seconds_count[1m])", "legendFormat": "GC pauses/s ({{action}})" },
+        { "expr": "rate(jvm_gc_pause_seconds_sum[1m])", "legendFormat": "GC time/s" }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Errors (KO) rate — inbound drops",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "rate(messenger_inbound_dropped_total[1m])", "legendFormat": "inbound dropped/s" },
+        { "expr": "rate(messenger_credits_exhausted_total[1m])", "legendFormat": "credits exhausted/s" }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Flow-control & sessions — credits exhausted, online clients",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "rate(messenger_credits_exhausted_total[1m])", "legendFormat": "credits exhausted/s (per-connection flood guard)" },
+        { "expr": "messenger_sessions_registered", "legendFormat": "online clients (gauge)" }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Outbox poller health — polls, skips, errors, regulated delay",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "rate(messenger_poller_polls_total[1m])", "legendFormat": "polls/s" },
+        { "expr": "rate(messenger_poller_skipped_total[1m])", "legendFormat": "skipped/s" },
+        { "expr": "rate(messenger_poller_errors_total[1m])", "legendFormat": "errors/s" },
+        { "expr": "messenger_poller_delay_milliseconds", "legendFormat": "regulated delay (ms)" },
+        { "expr": "messenger_poller_last_batch_size", "legendFormat": "last batch size" }
+      ]
+    }
+  ]
+}

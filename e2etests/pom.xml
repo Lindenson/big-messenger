@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>org.hormigas</groupId>
+  <artifactId>hormiga-messenger-karate-tests</artifactId>
+  <version>1.0.0</version>
+  <packaging>jar</packaging>
+
+  <name>HormigaMessanger — E2E Tests (Karate REST + JDK-WebSocket suite)</name>
+  <description>ATDD acceptance suite: Karate drives REST (UC-U##/UC-H##); a JUnit + JDK
+    java.net.http.WebSocket suite drives all live-WS scenarios (Karate 2.x paywalls WebSocket, and
+    1.4.1's GraalVM JS handler can't build on this JDK — so WS is covered with a real WS client).</description>
+
+  <properties>
+    <maven.compiler.source>21</maven.compiler.source>
+    <maven.compiler.target>21</maven.compiler.target>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <karate.version>1.4.1</karate.version>
+    <junit5.version>5.10.1</junit5.version>
+    <jackson.version>2.17.2</jackson.version>
+    <!-- Target environment (default dev/localhost). The `preprod` profile overrides all three at once,
+         so one switch (-Ppreprod) points BOTH suites — Karate (karate.env) and the JDK-WS suite
+         (e2e.baseUrl/e2e.wsUrl) — at the preprod host. -->
+    <e2e.env>dev</e2e.env>
+    <e2e.baseUrl>http://localhost:8080</e2e.baseUrl>
+    <e2e.wsUrl>ws://localhost:8080/ws</e2e.wsUrl>
+    <!-- JUnit5 @Tag filter for the WS suite (empty = run all). e.g. -De2e.groups=smoke / -De2e.groups=ws -->
+    <e2e.groups></e2e.groups>
+  </properties>
+
+  <dependencies>
+    <!-- Karate (OSS 1.4.1) — REST acceptance only. -->
+    <dependency>
+      <groupId>com.intuit.karate</groupId>
+      <artifactId>karate-junit5</artifactId>
+      <version>${karate.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.intuit.karate</groupId>
+      <artifactId>karate-core</artifactId>
+      <version>${karate.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <!-- Plain JUnit 5 + Jackson for the JDK-WebSocket suite (the WS client is java.net.http — no extra dep). -->
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit5.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <testResources>
+      <testResource>
+        <directory>src/test/java</directory>
+        <excludes><exclude>**/*.java</exclude></excludes>
+      </testResource>
+      <testResource>
+        <directory>src/test/resources</directory>
+      </testResource>
+    </testResources>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.2.5</version>
+        <configuration>
+          <!-- Karate REST runner + the JDK-WebSocket JUnit suite + standalone REST e2e (rate-limit). -->
+          <includes>
+            <include>**/*Runner.java</include>
+            <include>**/*WsTest.java</include>
+            <include>**/*RestTest.java</include>
+          </includes>
+          <systemPropertyVariables>
+            <karate.options></karate.options>
+            <karate.env>${e2e.env}</karate.env>
+            <e2e.baseUrl>${e2e.baseUrl}</e2e.baseUrl>
+            <e2e.wsUrl>${e2e.wsUrl}</e2e.wsUrl>
+          </systemPropertyVariables>
+          <!-- JUnit5 tag filter for the WS suite; empty = all. The Karate runner has no @Tag, so a
+               non-empty groups (e.g. smoke) selects only the tagged WS tests. -->
+          <groups>${e2e.groups}</groups>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+
+  <profiles>
+    <!-- Point the whole suite at the preprod host: mvn test -Ppreprod (JDK 21). -->
+    <profile>
+      <id>preprod</id>
+      <properties>
+        <e2e.env>preprod</e2e.env>
+        <e2e.baseUrl>http://preprod.example.com:8080</e2e.baseUrl>
+        <e2e.wsUrl>ws://preprod.example.com:8080/ws</e2e.wsUrl>
+      </properties>
+    </profile>
+  </profiles>
+</project>

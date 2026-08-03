@@ -1,0 +1,93 @@
+package org.hormigas.ws.core.router.pipeline;
+
+import io.smallrye.context.api.CurrentThreadContext;
+import io.smallrye.mutiny.Uni;
+import jakarta.enterprise.context.ApplicationScoped;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.eclipse.microprofile.context.ThreadContext;
+import org.hormigas.ws.core.router.OutboundRouter;
+import org.hormigas.ws.core.router.PipelineResolver;
+import org.hormigas.ws.core.router.context.RouterContext;
+import org.hormigas.ws.core.router.logger.RouterLogger;
+import org.hormigas.ws.core.router.logger.inout.OutboundRouterLogger;
+import org.hormigas.ws.core.router.stage.stages.CacheStage;
+import org.hormigas.ws.core.router.stage.stages.DeliveryStage;
+import org.hormigas.ws.core.router.stage.stages.FinalStage;
+import org.hormigas.ws.core.router.stage.stages.TetrisSentStage;
+import org.hormigas.ws.domain.message.Message;
+import org.hormigas.ws.domain.message.MessageEnvelope;
+import org.hormigas.ws.domain.message.MessageType;
+import org.hormigas.hl.contracts.stage.StageResult;
+
+@Slf4j
+@ApplicationScoped
+@RequiredArgsConstructor
+public class MessageOutboundRouter implements OutboundRouter<Message> {
+
+    private final PipelineResolver<Message, MessageType> pipelineResolver;
+    private final DeliveryStage deliveryStage;
+    private final TetrisSentStage tetrisSentStage;
+    private final CacheStage cacheStage;
+    private final FinalStage finalStage;
+
+    private final RouterLogger<Message> logger = new OutboundRouterLogger();
+
+    // Delivery hot path — same rationale as MessageInboundRouter.routeIn: @ApplicationScoped stages +
+    // reactive clients, no thread context needed across the async chain. Disable SmallRye context
+    // propagation to shed the ~30% per-message capture the inbound path already dropped (parity).
+    @CurrentThreadContext(propagated = {}, unchanged = ThreadContext.ALL_REMAINING)
+    @Override
+    public Uni<MessageEnvelope<Message>> routeOut(Message message) {
+
+        var pipeline = pipelineResolver.resolvePipeline(message);
+
+        message = message.toBuilder().serverTimestamp(System.currentTimeMillis()).build();
+        logger.logRoutingStart(message, pipeline);
+        var context = RouterContext.<Message>builder()
+                .pipelineType(pipeline)
+                .payload(message).build();
+        // An outbound message is read from the durable outbox, so it is by definition already
+        // persisted. Without this, DeliveryStage's persist-gate (persisted must be success) skips
+        // every poller (re)delivery — i.e. live redelivery never happens. Double-delivery to an
+        // already-served online recipient is prevented by the idempotency cache (DeliveryStage
+        // canDeliver → isInProgress); offline recipients (never cached) get the live redelivery.
+        context.setPersisted(StageResult.passed());
+
+        Uni<RouterContext<Message>> processed = switch (pipeline) {
+            case OUTBOUND_CACHED -> deliveryStage.apply(context)
+                    .onItem().transformToUni(cacheStage::apply)
+                    .onItem().transformToUni(tetrisSentStage::apply)
+                    .onItem().transformToUni(finalStage::apply);
+
+            case OUTBOUND_DIRECT -> deliveryStage.apply(context)
+                    .onItem().transformToUni(finalStage::apply);
+
+            // Strategy C: deliver + cache (dedup across poller re-fetches) but NO Tetris mark — a
+            // system notice must not enter the watermark (else it could head-of-line-block A's GC).
+            // Durability is the dead_letter DRAFT, not the outbox row (ADR-014).
+            case OUTBOUND_TRANSIENT -> deliveryStage.apply(context)
+                    .onItem().transformToUni(cacheStage::apply)
+                    .onItem().transformToUni(finalStage::apply);
+
+            case SKIP -> finalStage.apply(context);
+
+            default -> {
+                log.error("Unhandled pipeline: {} for message: {}", pipeline, message);
+                yield finalStage.apply(context.withError(new IllegalStateException("Unhandled pipeline: " + pipeline)));
+            }
+        };
+
+        return logAndEnvelope(processed);
+    }
+
+    private Uni<MessageEnvelope<Message>> logAndEnvelope(Uni<RouterContext<Message>> processed) {
+        return processed.onItem()
+                .invoke(logger::logRoutingResult).onItem()
+                .transform(pc ->
+                        MessageEnvelope.<Message>builder()
+                                .message(pc.getPayload())
+                                .processed(pc.isDone())
+                                .build());
+    }
+}

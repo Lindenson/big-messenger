@@ -1,0 +1,70 @@
+"%test":
+  quarkus:
+    http:
+      port: 7777
+
+    # Phase 5b: the poller reads/GC run on a second reactive datasource in prod. Tests must resolve the
+    # @ReactiveDataSource("poller") injection point — Dev Services provisions it (one shared container for
+    # the whole @QuarkusTest run). No @QuarkusTest does a cross-datasource outbox round-trip, so a separate
+    # test DB is harmless.
+    datasource:
+      # With a second (named) datasource present, Quarkus no longer auto-infers the default's db-kind —
+      # state it explicitly so Dev Services still provisions the default Postgres.
+      db-kind: postgresql
+      # The poller datasource must share the DEFAULT's Dev Services database (same schema + data) so the
+      # persist→fetch round-trip in OutboxPostgresRepositoryTest works. Disable its own Dev Service and
+      # point it at the default's (Dev-Services-filled) url/credentials — a separate reactive POOL over the
+      # same physical DB, mirroring prod (where both point at the same Postgres url).
+      "poller":
+        db-kind: postgresql
+        jdbc: false
+        devservices:
+          enabled: false
+        username: ${quarkus.datasource.username}
+        password: ${quarkus.datasource.password}
+        reactive:
+          url: ${quarkus.datasource.reactive.url}
+
+  # The OrderEventConsumer's @Incoming("order-events-in") channel is backed by the in-memory
+  # connector in tests (no Kafka broker / Dev Services needed). OrderEventConsumerTest drives it
+  # via InMemoryConnector; the other @QuarkusTest apps just leave it idle.
+  mp:
+    messaging:
+      incoming:
+        order-events-in:
+          connector: smallrye-in-memory
+      # The offline-push producer's @Channel("offline-push-out") is backed by the in-memory connector
+      # in tests (no Kafka broker). Unit tests mock the OfflineEventPublisher port, so this just lets the
+      # KafkaOfflineEventPublisher bean's emitter wire without a broker under @QuarkusTest.
+      outgoing:
+        offline-push-out:
+          connector: smallrye-in-memory
+
+  processing:
+    messages:
+      inbound:
+        queue-size: 3000
+      outbound:
+        batch-size: 1500
+        queue-size: 5000
+        polling-ms: "800ms"
+      feedback:
+        additional-ms: 700     # base added poll delay
+        adjustment-factor: 2.0  # growth on drops (>1 → slow down)
+        recovery-factor: 0.5    # decay toward base when stable (<1)
+        max-ms: 30000           # cap on the added delay
+      channel:
+        retry: true
+        min-backoff-ms: 300
+        max-backoff-ms: 1000
+        max-retries: 3
+      credits:
+        max-value: 100
+        refill-rate-per-s: 10
+      collector:
+        every-s: "10s"
+      idempotent:
+        ttl-seconds: 3
+      storage:
+        service: redis
+

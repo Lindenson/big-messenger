@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Maven credentials for GitHub Packages. Put at ~/.m2/settings.xml (developers) or provide in CI.
+  Each <server><id> must match a <repository><id> used in the app pom (consumer-repositories.snippet.xml)
+  and the <distributionManagement><id> = "github" used when PUBLISHING from each module.
+
+  Token: a GitHub PAT (classic) with:
+    - read:packages   to CONSUME
+    - write:packages  to PUBLISH
+  A PAT (not the built-in GITHUB_TOKEN) is required because reads cross private repos (hl/hl-redis pull
+  the contracts package) — the built-in token can't do that on a personal account. In CI this is the
+  PACKAGES_TOKEN secret used by publish-on-tag.yml.
+  Prefer env indirection over a literal token in the file: <password>${env.PACKAGES_TOKEN}</password>.
+-->
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0
+                              https://maven.apache.org/xsd/settings-1.0.0.xsd">
+    <servers>
+        <!-- Consuming: one per repository <id> in the app pom -->
+        <server>
+            <id>github-hl-contracts</id>
+            <username>YOUR_GITHUB_USERNAME</username>
+            <password>${env.PACKAGES_TOKEN}</password>
+        </server>
+        <server>
+            <id>github-hl</id>
+            <username>YOUR_GITHUB_USERNAME</username>
+            <password>${env.PACKAGES_TOKEN}</password>
+        </server>
+        <server>
+            <id>github-hl-redis</id>
+            <username>YOUR_GITHUB_USERNAME</username>
+            <password>${env.PACKAGES_TOKEN}</password>
+        </server>
+
+        <!-- Publishing: matches <distributionManagement><id>github</id> in each module pom -->
+        <server>
+            <id>github</id>
+            <username>YOUR_GITHUB_USERNAME</username>
+            <password>${env.PACKAGES_TOKEN}</password>
+        </server>
+    </servers>
+</settings>
